@@ -3,7 +3,7 @@ package gears.util
 import scala.util.boundary
 
 object either:
-  opaque type Label[-E, -T] = boundary.Label[Either[E, T]]
+  type Label[-E, -T] = boundary.Label[Either[E, T]]
 
   /** Starts a body that returns a `T` wrapped in an [[Either]]. Within this
     * body, `.?` is available on [[Either]] values, short-circuiting back to

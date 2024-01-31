@@ -5,6 +5,8 @@ import scala.util.boundary
 object either:
   type Label[-E, -T] = boundary.Label[Either[E, T]]
 
+  inline def error[E](e: E)(using Label[E, Nothing]) = boundary.break(Left(e))
+
   /** Starts a body that returns a `T` wrapped in an [[Either]]. Within this
     * body, `.?` is available on [[Either]] values, short-circuiting back to
     * this function's caller if a [[Left]] is seen.

@@ -31,3 +31,15 @@ lazy val root =
         libraryDependencies += "org.scalameta" %%% "munit" % "1.0.0-M10+15-3940023e-SNAPSHOT" % Test
       )
     )
+
+lazy val jvm =
+  project
+    .in(file("./gears-io-jvm"))
+    .dependsOn(root.jvm)
+    .settings(
+      Seq(
+        name := "Gears IO JVM",
+        organization := "ch.epfl.lamp",
+        version := "0.1.0-SNAPSHOT"
+      )
+    )

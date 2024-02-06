@@ -39,7 +39,7 @@ trait Reader:
 trait Writer:
   /** Creates a source that writes into the given (shared) buffer.
     */
-  def writeBuf(buf: Buffer)(using Async): IOFuture[Int]
+  def writeBuf(buf: Buffer)(using Async): Result[Unit]
 
 /** Wraps a reader and provides with with buffering capabilities.
   *

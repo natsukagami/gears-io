@@ -43,3 +43,13 @@ lazy val jvm =
         version := "0.1.0-SNAPSHOT"
       )
     )
+
+lazy val sandbox =
+  crossProject(JVMPlatform, NativePlatform)
+    .crossType(CrossType.Full)
+    .in(file("./sandbox"))
+    .dependsOn(root)
+    .configurePlatform(JVMPlatform)(_.dependsOn(jvm))
+    .settings(
+      Seq(name := "gears IO sandbox")
+    )

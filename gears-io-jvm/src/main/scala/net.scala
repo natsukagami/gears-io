@@ -10,33 +10,26 @@ import gears.async.Async
 import java.net.SocketAddress
 import gears.util.either
 import scala.util.Try
+import java.nio.channels.Channels
 
 /** The simplest possible TCP stream implementation, technically just wrapping
   * Java's [[java.net.Socket]] and rely on Virtual Thread suspensions.
   */
 class TcpStream(val socket: java.net.Socket) extends net.TcpStream:
-  val input = socket.getInputStream()
-  val output = socket.getOutputStream()
+  val input = Channels.newChannel(socket.getInputStream())
+  val output = Channels.newChannel(socket.getOutputStream())
 
   override def readBuf(buf: Buffer)(using Async): Result[Unit] = either:
-    val bytesRead = input.read(
-      buf.array(),
-      buf.arrayOffset() + buf.position(),
-      buf.limit() - buf.position()
-    )
+    val bytesRead = input.read(buf)
     if bytesRead == -1 then either.error(Error.EOF)
-    else buf.position(buf.position() + bytesRead)
 
   override def close(): Unit =
+    input.close()
+    output.close()
     socket.close()
 
   override def writeBuf(buf: Buffer)(using Async): Result[Unit] = either:
-    output.write(
-      buf.array(),
-      buf.arrayOffset() + buf.position(),
-      buf.limit() - buf.position()
-    )
-    buf.position(buf.limit())
+    output.write(buf)
 
   override lazy val localAddress: SocketAddress = socket.getLocalSocketAddress()
   override lazy val remoteAddress: SocketAddress =
@@ -53,7 +46,9 @@ class TcpListener(val socket: java.net.ServerSocket) extends net.TcpListener:
     val thread = Thread
       .ofVirtual()
       .start: () =>
-        stream = Try { socket.accept() }
+        stream = Try:
+          socket.accept()
+    // TODO: catch and throw CancellationException
     async.cancellationScope(() => thread.interrupt()):
       thread.join()
       Right(TcpStream(stream.get))
@@ -64,13 +59,14 @@ object JvmTcpSupport extends net.TcpSupport {
   type Stream = TcpStream
   type Listener = TcpListener
 
-  override def connect(address: SocketAddress): Result[Stream] =
+  override def connect(address: SocketAddress)(using Async): Result[Stream] =
     val socket = java.net.Socket()
     socket.connect(address)
     Right(TcpStream(socket))
 
-  override def listen(address: SocketAddress): Result[Listener] =
+  override def listen(address: SocketAddress)(using Async): Result[Listener] =
     val socket = java.net.ServerSocket()
+    socket.setReuseAddress(true)
     socket.bind(address)
     Right(TcpListener(socket))
 }

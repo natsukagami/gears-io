@@ -15,6 +15,8 @@ import scala.util.Failure
 import scala.util.Try
 import gears.async.Async.OriginalSource
 import java.util.concurrent.atomic.AtomicReference
+import scala.collection.mutable.ArrayBuffer
+import scala.collection.mutable.ArraySeq
 
 /** The general buffer type of the traits. */
 type Buffer = java.nio.ByteBuffer
@@ -59,9 +61,32 @@ class BufferedReader(bufSize: Int)(reader: Reader) extends Reader:
     * any pending reads.
     */
   def isEOF =
-    assert(readPending.get == false)
     gotEOF && !buffer.hasRemaining()
 
+  /* Parsing */
+
+  /** Read all bytes until EOF to an [[ArrayBuffer]]. */
+  def readAll()(using Async) = either:
+    mustPending:
+      val buf = ArrayBuffer[Byte]()
+      while !isEOF do
+        buf ++= ArraySeq
+          .ofByte(buffer.array())
+          .slice(buffer.arrayOffset() + buffer.position(), buffer.remaining())
+        readToInternal() match
+          case Left(Error.EOF) => ()
+          case result          => result.?
+      buf
+
+  private inline def mustPending[T](inline body: => T) =
+    if readPending.compareAndExchange(false, true) == false then
+      try
+        body
+      finally
+        readPending.set(false)
+    else throw ReadPendingException()
+
+  /** Create a race-able read source. */
   def readBufSrc(buf: Buffer)(using Async) =
     new OriginalSource[Try[Result[Unit]]]:
       src =>
@@ -125,14 +150,18 @@ class BufferedReader(bufSize: Int)(reader: Reader) extends Reader:
         true
 
   private def readToInternal()(using Async) =
-    reader.readBuf(buffer) match
-      case v @ Left(Error.EOF) =>
-        gotEOF = true
-        v
-      case v => v
+    buffer.clear()
+    val result = reader.readBuf(buffer)
+    if result == Left(Error.EOF) then gotEOF = true
+    buffer.flip()
+    result
 
   private inline def copyToBuf(buf: Buffer) =
-    buf.put(buffer.limit(buf.remaining()))
+    if buf.remaining() >= buffer.remaining() then buf.put(buffer)
+    else
+      val toCopy = buf.remaining()
+      buf.put(buffer.slice(buffer.position(), toCopy))
+      buffer.position(buffer.position() + toCopy)
 
   override def readBuf(buf: Buffer)(using Async): Result[Unit] = either:
     if buffer.hasRemaining then copyToBuf(buf)
@@ -142,14 +171,10 @@ class BufferedReader(bufSize: Int)(reader: Reader) extends Reader:
       copyToBuf(buf)
 
   // private stuff
-  private val buffer = java.nio.ByteBuffer.allocate(bufSize)
+  private val buffer = java.nio.ByteBuffer.allocate(bufSize).limit(0)
   private var gotEOF = false
   private val readPending = AtomicBoolean(false)
 end BufferedReader
-
-object BufferedReader:
-  // Simple listener that we have internally just for putting into `unsafeReadBuf`.
-  private val readListener = Listener.acceptingListener((_, _) => ())
 
 /** Possible errors that could occur during IO. */
 enum Error:

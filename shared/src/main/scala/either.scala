@@ -19,6 +19,6 @@ object either:
     /** Unwraps an [[Either]], short-circuiting to the matching [[either]] call
       * if the value is a [[Left]].
       */
-    def ?(using Label[E, Nothing]): T = e match
+    inline def ?(using Label[E, Nothing]): T = e match
       case Left(ex)     => boundary.break(Left(ex))
       case Right(value) => value

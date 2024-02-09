@@ -44,6 +44,17 @@ lazy val jvm =
       )
     )
 
+lazy val nativeEpoll = project
+  .in(file("./gears-io-native-epoll"))
+  .dependsOn(root.native)
+  .settings(
+    Seq(
+      name := "Gears IO Native epoll",
+      organization := "ch.epfl.lamp",
+      version := "0.1.0-SNAPSHOT"
+    )
+  )
+
 lazy val sandbox =
   crossProject(JVMPlatform, NativePlatform)
     .crossType(CrossType.Full)

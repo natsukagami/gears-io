@@ -1,8 +1,7 @@
 package sandbox
 
-import sandbox.net.given
+import sandbox.async.given
 
-import gears.async.default.given
 import gears.async.net.TcpSupport
 import java.net.InetSocketAddress
 import gears.async.Async

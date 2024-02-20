@@ -7,6 +7,8 @@ object either:
 
   inline def error[E](e: E)(using Label[E, Nothing]) = boundary.break(Left(e))
 
+  inline def ok[T](v: T) = Right(v)
+
   /** Starts a body that returns a `T` wrapped in an [[Either]]. Within this
     * body, `.?` is available on [[Either]] values, short-circuiting back to
     * this function's caller if a [[Left]] is seen.

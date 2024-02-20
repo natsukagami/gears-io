@@ -142,11 +142,9 @@ class BufferedReader(bufSize: Int)(reader: Reader) extends Reader:
             underlyingFuture = (k, fut)
 
       def copyAndComplete(k: Listener): true =
-        k.lockCompletely(src) match
-          case Listener.Gone => ()
-          case Listener.Locked =>
-            copyToBuf(buf)
-            k.complete(Success(Right(())), src)
+        if k.acquireLock() then
+          copyToBuf(buf)
+          k.complete(Success(Right(())), src)
         true
 
   private def readToInternal()(using Async) =

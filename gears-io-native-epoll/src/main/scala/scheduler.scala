@@ -79,7 +79,7 @@ class ExecutorWithPollThread(val exec: ExecutionContext, val poller: Poller)
       sleepingUntil = sleepers.headOption.map(_.wakeTime)
       val current = sleepingUntil match
         case None =>
-          this.wait()
+          poller.poll(-1.seconds)
           Deadline.now
         case Some(value) =>
           val current0 = Deadline.now

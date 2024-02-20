@@ -23,7 +23,7 @@ def runClient(client: net.TcpStream)(using Async) =
     either:
       val out = buffered.readAll().?
       val str = new String(out.toArray, StandardCharsets.UTF_8)
-      println(str)
+      println(s"Read: $str")
       str.trim().toInt
   .get
 
@@ -41,6 +41,7 @@ def runServer(server: net.TcpListener, runs: Int)(using Async) =
             buf.put(toSend)
             buf.flip()
             conn.writeBuf(buf).?
+            println(s"wrote $i")
             conn.close()
     futures.awaitAll.foreach(_.get.?)
   server.close()
@@ -64,7 +65,7 @@ def runServer(server: net.TcpListener, runs: Int)(using Async) =
           either:
             val client = TcpSupport.connect(addr).?
             runClient(client).?
-      // serverFut.await.?
+      serverFut.await
       futures.awaitAll.map(_.?)
     .match
       case Left(value)  => throw Exception(s"IO error: $value")

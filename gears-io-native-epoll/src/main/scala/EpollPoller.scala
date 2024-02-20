@@ -76,6 +76,7 @@ class EpollPoller(epfd: Int) extends Closeable, Poller:
             .castRawPtrToObject(toRawPtr(event.data))
             .asInstanceOf[PollHandle]
           handle.notify(event.events.toInt)
+          // println(s"Notifying ${handle.fd} with ${event.events}")
         if count == MAX_EVENTS then loop(0)
 
     val timeoutSecs =
@@ -87,7 +88,7 @@ class EpollPoller(epfd: Int) extends Closeable, Poller:
       read: Boolean,
       write: Boolean
   ): (PollHandle, Cancellable) =
-    val handle = PollHandle()
+    val handle = PollHandle(fd)
     Zone: zone =>
       val event = alloc[epoll_event]()(using zone)
       event.events =
@@ -117,51 +118,52 @@ class EpollPoller(epfd: Int) extends Closeable, Poller:
 class MonitorChange() extends Source[Try[Int]], Cancellable:
   // Increases every time the monitor is updated.
   @volatile private var _counter = 0
-  @volatile private var listener: Listener[Try[Int]] = null
+  private val listeners: mutable.Set[Listener[Try[Int]]] =
+    mutable.Set()
 
   def counter = _counter
 
   override def poll(k: Listener[Try[Int]]): Boolean =
     false // assume nothing is coming until update()
   override def onComplete(k: Listener[Try[Int]]): Unit = synchronized:
-    if this.listener != null then
-      throw /* TODO make this the correct exception */ ReadPendingException()
-    this.listener = listener
+    listeners += k
   override def dropListener(k: Listener[Try[Int]]): Unit = synchronized:
-    if listener == k then listener = null
+    listeners -= k
 
   /* Returns whether the counter has been updated from the current known state. */
   def poll(current: Int = 0) = _counter != current
 
   def onUpdate(listener: Listener[Try[Int]], current: Int): Unit =
     val runNow = synchronized:
-      if this.listener != null then
-        throw /* TODO make this the correct exception */ ReadPendingException()
       if current != _counter then true
       else
-        this.listener = listener
+        listeners += listener
         false
-    if runNow then listener.completeNow(Success(current), this)
+    if runNow then listener.completeNow(Success(_counter), this)
 
   def onUpdate(current: Int)(using Async): Int =
     if current != _counter then _counter
     else this.await
 
   def cancel() =
-    val listener = this.listener
-    this.listener = null
-    if (listener != null)
+    val toLoop = synchronized:
+      val ls = listeners.toSeq
+      listeners.clear()
+      ls
+    for listener <- toLoop do
       listener.completeNow(Failure(CancellationException()), this)
 
   // Increment the counter and trigger the listener if it exists.
   def update() =
     val n = _counter + 1
     _counter = n
-    val lis = listener
-    listener = null
-    if lis != null then lis.completeNow(Success(n), this)
+    val toLoop = synchronized:
+      val ls = listeners.toSeq
+      listeners.clear()
+      ls
+    for listener <- toLoop do listener.completeNow(Success(n), this)
 
-class PollHandle():
+class PollHandle(val fd: Int):
   val read = MonitorChange()
   val write = MonitorChange()
 

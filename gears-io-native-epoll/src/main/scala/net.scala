@@ -19,6 +19,8 @@ import scala.scalanative.unsigned._
 import scala.scalanative.javalibintf.SocketFd
 import scala.annotation.tailrec
 import java.net.SocketException
+import java.io.InputStream
+import java.net.SocketTimeoutException
 
 class EpollTcpStream private[epoll] (
     socket: java.net.Socket,
@@ -28,25 +30,34 @@ class EpollTcpStream private[epoll] (
   private val (handle, cancel) =
     poller.registerFd(fd, true, true)
 
-  private val inputStream = socket.getInputStream()
-  private val input = Channels.newChannel(inputStream)
-
   override def close(): Unit =
     socket.close()
     cancel.cancel()
-    input.close()
+
+  inline def debug[T](msg: String)(inline value: => T): T =
+    val t = value
+    println(s"$msg: $t")
+    t
 
   override def readBuf(buf: Buffer)(using Async): Result[Unit] = either:
-    var current = handle.read.counter
-    // @tailrec def loop(current: Int): Result[Unit] =
-    //   try
-    //     val conn = socket.accept()
-    //     either.ok(EpollTcpStream(conn, poller))
-    //   catch
-    //     case _: SocketException if errno.errno == errno.EAGAIN =>
-    //       loop(handle.read.onUpdate(current))
-    //     case e => throw e
-    // if input.read(buf) == -1 then either.error(Error.EOF)
+    val inputStream = new InputStream {
+      val inner = socket.getInputStream()
+      override def read(): Int =
+        val b = scala.Array(0.toByte)
+        if read(b) == -1 then -1 else b(0).toByte
+      override def read(b: scala.Array[Byte], off: Int, len: Int): Int =
+        @tailrec def loop(current: Int): Int =
+          try inner.read(b, off, len)
+          catch
+            case _: SocketTimeoutException => // either EAGAIN or EWOULDBLOCK
+              loop(handle.read.onUpdate(current))
+            case e => throw e
+          // debug(s"read from $fd (count $len)")(
+        loop(handle.read.counter)
+        // )
+    }
+    if Channels.newChannel(inputStream).read(buf) == -1 then
+      either.error(Error.EOF)
 
   override def writeBuf(buf: Buffer)(using Async): Result[Unit] = either:
     val outputStream = new OutputStream:
@@ -100,7 +111,8 @@ class EpollTcpListener private[epoll] (
         val conn = socket.accept()
         either.ok(EpollTcpStream(conn, poller))
       catch
-        case _: SocketException if errno.errno == errno.EAGAIN =>
+        case _: SocketException
+            if errno.errno == errno.EAGAIN || errno.errno == errno.EWOULDBLOCK =>
           loop(handle.read.onUpdate(current))
         case e => throw e
     loop(handle.read.counter)

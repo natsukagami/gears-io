@@ -2,6 +2,8 @@ import sbtcrossproject.CrossPlugin.autoImport.{crossProject, CrossType}
 import scalanative.build._
 
 ThisBuild / scalaVersion := "3.3.1"
+val gearsVersion = "0.2.0"
+val gearsIOVersion = s"${gearsVersion}-SNAPSHOT"
 
 lazy val root =
   crossProject(JVMPlatform, NativePlatform)
@@ -11,23 +13,24 @@ lazy val root =
       Seq(
         name := "Gears Socket IO",
         organization := "ch.epfl.lamp",
-        version := "0.1.0-SNAPSHOT",
-        libraryDependencies += "ch.epfl.lamp" %%% "gears" % "0.1.0-SNAPSHOT",
+        version := gearsIOVersion,
+        libraryDependencies ++= Seq(
+          "ch.epfl.lamp" %%% "gears" % gearsVersion,
+          "org.scalameta" %% "munit" % "1.0.0-RC1" % Test
+        ),
         testFrameworks += new TestFramework("munit.Framework")
       )
     )
     .jvmSettings(
       Seq(
-        javaOptions += "--version 21",
-        libraryDependencies += "org.scalameta" %% "munit" % "1.0.0-M10" % Test
+        javaOptions += "--version 21"
       )
     )
     .nativeSettings(
       Seq(
         nativeConfig ~= { c =>
-          c.withMultithreadingSupport(true)
-        },
-        libraryDependencies += "org.scalameta" %%% "munit" % "1.0.0-M10+15-3940023e-SNAPSHOT" % Test
+          c.withMultithreading(true)
+        }
       )
     )
 
@@ -39,7 +42,7 @@ lazy val jvm =
       Seq(
         name := "Gears IO JVM",
         organization := "ch.epfl.lamp",
-        version := "0.1.0-SNAPSHOT"
+        version := gearsIOVersion
       )
     )
 
@@ -50,7 +53,7 @@ lazy val nativeEpoll = project
   .settings(
     Seq(
       nativeConfig ~= { c =>
-        c.withMultithreadingSupport(true)
+        c.withMultithreading(true)
           .withLTO(LTO.none)
           .withMode(Mode.debug)
           .withGC(GC.immix)
@@ -59,8 +62,8 @@ lazy val nativeEpoll = project
       organization := "ch.epfl.lamp",
       version := "0.1.0-SNAPSHOT",
       libraryDependencies ++= Seq(
-        "ch.epfl.lamp" %%% "gears" % "0.1.0-SNAPSHOT",
-        "org.scala-native" % "javalib-intf" % "0.5.0-SNAPSHOT"
+        "ch.epfl.lamp" %%% "gears" % gearsVersion
+        // "org.scala-native" % "javalib-intf" % "0.5.0-SNAPSHOT"
       )
     )
   )
@@ -78,7 +81,7 @@ lazy val sandbox =
     .nativeSettings(
       Seq(
         nativeConfig ~= { c =>
-          c.withMultithreadingSupport(true)
+          c.withMultithreading(true)
             .withLTO(LTO.none)
             .withMode(Mode.debug)
             .withGC(GC.immix)

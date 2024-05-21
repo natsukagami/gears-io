@@ -47,7 +47,7 @@ class EpollPoller(epfd: Int) extends Closeable, Poller:
     unistd.write(fd, buf, size)
 
   override def poll(timeout: Duration) =
-    Zone: zone =>
+    Zone.acquire: zone =>
       if timeout.toNanos != 0 then
         val pipeFds = alloc[CArray[CInt, Nat._2]]()(using zone)
         if unistd.pipe(pipeFds.at(0)) < 0 then throw IOException(errno.errno)
@@ -89,7 +89,7 @@ class EpollPoller(epfd: Int) extends Closeable, Poller:
       write: Boolean
   ): (PollHandle, Cancellable) =
     val handle = PollHandle(fd)
-    Zone: zone =>
+    Zone.acquire: zone =>
       val event = alloc[epoll_event]()(using zone)
       event.events =
         (EPOLLET | (if read then EPOLLIN else 0) | (if write then EPOLLOUT

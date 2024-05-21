@@ -16,7 +16,6 @@ import scala.scalanative.posix.unistd
 import scala.scalanative.runtime._
 import scala.scalanative.unsafe._
 import scala.scalanative.unsigned._
-import scala.scalanative.javalibintf.SocketFd
 import scala.annotation.tailrec
 import java.net.SocketException
 import java.io.InputStream

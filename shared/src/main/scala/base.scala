@@ -87,7 +87,9 @@ class BufferedReader(bufSize: Int)(reader: Reader) extends Reader:
     else throw ReadPendingException()
 
   /** Create a race-able read source. */
-  def readBufSrc(buf: Buffer)(using Async) =
+  def readBufSrc(
+      buf: Buffer
+  )(using async: Async, spawn: Async.Spawn & async.type) =
     new OriginalSource[Try[Result[Unit]]]:
       src =>
       type Listener = gears.async.Listener[Try[Result[Unit]]]

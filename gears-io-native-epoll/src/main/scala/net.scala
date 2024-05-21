@@ -20,12 +20,13 @@ import scala.annotation.tailrec
 import java.net.SocketException
 import java.io.InputStream
 import java.net.SocketTimeoutException
+import gears.async.net.SocketOption
 
 class EpollTcpStream private[epoll] (
     socket: java.net.Socket,
     poller: EpollPoller
 ) extends net.TcpStream:
-  private val fd = SocketFd.ofSocket(socket)
+  private val fd = ??? // SocketFd.ofSocket(socket)
   private val (handle, cancel) =
     poller.registerFd(fd, true, true)
 
@@ -97,7 +98,7 @@ class EpollTcpListener private[epoll] (
 ) extends net.TcpListener:
   type Stream = EpollTcpStream
 
-  val fd = SocketFd.ofServerSocket(socket)
+  val fd = ??? // SocketFd.ofServerSocket(socket)
   val (handle, cancel) = poller.registerFd(fd, true, false)
 
   override def close(): Unit =
@@ -122,13 +123,19 @@ trait EpollTcpSupport(poller: EpollPoller) extends net.TcpSupport:
   type Stream = EpollTcpStream
   type Listener = EpollTcpListener
 
-  override def connect(address: SocketAddress)(using Async): Result[Stream] =
+  override def connect(address: SocketAddress, options: Seq[SocketOption])(using
+      Async
+  ): Result[Stream] =
     val socket = java.net.Socket()
+    options.foreach(op => socket.setOption(op.key, op.value))
     socket.connect(address)
     either.ok(EpollTcpStream(socket, poller))
 
-  override def listen(address: SocketAddress)(using Async): Result[Listener] =
+  override def listen(address: SocketAddress, options: Seq[SocketOption])(using
+      Async
+  ): Result[Listener] =
     val socket = java.net.ServerSocket()
+    options.foreach(op => socket.setOption(op.key, op.value))
     socket.setReuseAddress(true)
     socket.bind(address)
     either.ok(EpollTcpListener(socket, poller))

@@ -11,6 +11,7 @@ import java.net.SocketAddress
 import gears.util.either
 import scala.util.Try
 import java.nio.channels.Channels
+import gears.async.net.SocketOption
 
 /** The simplest possible TCP stream implementation, technically just wrapping
   * Java's [[java.net.Socket]] and rely on Virtual Thread suspensions.
@@ -49,7 +50,7 @@ class TcpListener(val socket: java.net.ServerSocket) extends net.TcpListener:
         stream = Try:
           socket.accept()
     // TODO: catch and throw CancellationException
-    async.cancellationScope(() => thread.interrupt()):
+    async.JvmAsyncOperations.jvmInterruptible:
       thread.join()
       Right(TcpStream(stream.get))
 
@@ -59,13 +60,19 @@ object JvmTcpSupport extends net.TcpSupport {
   type Stream = TcpStream
   type Listener = TcpListener
 
-  override def connect(address: SocketAddress)(using Async): Result[Stream] =
+  override def connect(address: SocketAddress, options: Seq[SocketOption])(using
+      Async
+  ): Result[Stream] =
     val socket = java.net.Socket()
+    options.foreach(op => socket.setOption(op.key, op.value))
     socket.connect(address)
     Right(TcpStream(socket))
 
-  override def listen(address: SocketAddress)(using Async): Result[Listener] =
+  override def listen(address: SocketAddress, options: Seq[SocketOption])(using
+      Async
+  ): Result[Listener] =
     val socket = java.net.ServerSocket()
+    options.foreach(op => socket.setOption(op.key, op.value))
     socket.setReuseAddress(true)
     socket.bind(address)
     Right(TcpListener(socket))

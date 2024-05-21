@@ -28,22 +28,23 @@ def runClient(client: net.TcpStream)(using Async) =
   .get
 
 def runServer(server: net.TcpListener, runs: Int)(using Async) =
-  either:
-    val futures =
-      for i <- 1 to runs
-      yield Future:
-        val conn = server.accept().?
-        println(s"accepting $i")
-        Using(conn): conn =>
-          either:
-            val buf = ByteBuffer.allocate(10)
-            val toSend = i.toString().getBytes(StandardCharsets.UTF_8)
-            buf.put(toSend)
-            buf.flip()
-            conn.writeBuf(buf).?
-            println(s"wrote $i")
-            conn.close()
-    futures.awaitAll.foreach(_.get.?)
+  Async.group:
+    either:
+      val futures =
+        for i <- 1 to runs
+        yield Future:
+          val conn = server.accept().?
+          println(s"accepting $i")
+          Using(conn): conn =>
+            either:
+              val buf = ByteBuffer.allocate(10)
+              val toSend = i.toString().getBytes(StandardCharsets.UTF_8)
+              buf.put(toSend)
+              buf.flip()
+              conn.writeBuf(buf).?
+              println(s"wrote $i")
+              conn.close()
+      futures.awaitAll.foreach(_.get.?)
   server.close()
 
 @main def main() =

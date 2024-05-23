@@ -26,19 +26,28 @@ import scala.scalanative.unsigned._
 import scala.util.Failure
 import scala.util.Success
 import scala.util.Try
+import javax.management.monitor.Monitor
 
 class IOException(error: Int) extends Exception:
   override def toString(): String =
     "IO Error: " + fromCString(string.strerror(error))
 
 class EpollPoller(epfd: Int) extends Closeable, Poller:
-
+  import EpollPoller.*
   override def close(): Unit =
     if unistd.close(epfd) != 0 then throw IOException(errno.errno)
 
   // store handles only for GC purposes
-  val handles = mutable.Set[PollHandle]()
-  var interruptHandle: Option[CInt] = None
+  private val handles = mutable.Set[EpollHandle]()
+  private var interruptHandle: Option[CInt] = None
+
+  // Overrides handles with cancellation what is aware of this poller.
+  // Note that this handle must still be manually added to the `handles` set.
+  private class EpollHandle(fd: Int) extends PollHandle(fd):
+    override def cancel() =
+      epoll_ctl(epfd, EPOLLONESHOT, fd, null)
+      super.cancel()
+      handles -= this
 
   override def wake() = interruptHandle.foreach: fd =>
     val size = 8.toUInt
@@ -51,11 +60,11 @@ class EpollPoller(epfd: Int) extends Closeable, Poller:
       if timeout.toNanos != 0 then
         val pipeFds = alloc[CArray[CInt, Nat._2]]()(using zone)
         if unistd.pipe(pipeFds.at(0)) < 0 then throw IOException(errno.errno)
-        val (_, cancel) = registerFd(!pipeFds.at(0), true, false)
+        val handle = registerFd(!pipeFds.at(0), true, false)
         interruptHandle = Some(!pipeFds.at(1))
         try pollImpl(timeout)(using zone)
         finally
-          cancel.cancel()
+          handle.cancel()
           interruptHandle = None
           unistd.close(!pipeFds.at(0))
           unistd.close(!pipeFds.at(1))
@@ -87,8 +96,8 @@ class EpollPoller(epfd: Int) extends Closeable, Poller:
       fd: Int,
       read: Boolean,
       write: Boolean
-  ): (PollHandle, Cancellable) =
-    val handle = PollHandle(fd)
+  ): PollHandle =
+    val handle = new EpollHandle(fd)
     Zone.acquire: zone =>
       val event = alloc[epoll_event]()(using zone)
       event.events =
@@ -108,69 +117,66 @@ class EpollPoller(epfd: Int) extends Closeable, Poller:
       if epoll_ctl(epfd, EPOLL_CTL_ADD, fd, event) == -1 then
         throw IOException(errno.errno)
       handles += handle
+      handle
 
-      val cancel: Cancellable = () =>
-        epoll_ctl(epfd, EPOLLONESHOT, fd, null)
-        handle.cancelMonitors()
-        handles -= handle
-      (handle, cancel)
+object EpollPoller:
+  class MonitorChange extends Source[Try[Int]], Cancellable:
+    // Increases every time the monitor is updated.
+    @volatile private var _counter = 0
+    private val listeners: mutable.Set[Listener[Try[Int]]] =
+      mutable.Set()
 
-class MonitorChange() extends Source[Try[Int]], Cancellable:
-  // Increases every time the monitor is updated.
-  @volatile private var _counter = 0
-  private val listeners: mutable.Set[Listener[Try[Int]]] =
-    mutable.Set()
+    def counter = _counter
 
-  def counter = _counter
+    override def poll(k: Listener[Try[Int]]): Boolean =
+      false // assume nothing is coming until update()
+    override def onComplete(k: Listener[Try[Int]]): Unit = synchronized:
+      listeners += k
+    override def dropListener(k: Listener[Try[Int]]): Unit = synchronized:
+      listeners -= k
 
-  override def poll(k: Listener[Try[Int]]): Boolean =
-    false // assume nothing is coming until update()
-  override def onComplete(k: Listener[Try[Int]]): Unit = synchronized:
-    listeners += k
-  override def dropListener(k: Listener[Try[Int]]): Unit = synchronized:
-    listeners -= k
+    /* Returns whether the counter has been updated from the current known state. */
+    def poll(current: Int = 0) = _counter != current
 
-  /* Returns whether the counter has been updated from the current known state. */
-  def poll(current: Int = 0) = _counter != current
+    def onUpdate(listener: Listener[Try[Int]], current: Int): Unit =
+      val runNow = synchronized:
+        if current != _counter then true
+        else
+          listeners += listener
+          false
+      if runNow then listener.completeNow(Success(_counter), this)
 
-  def onUpdate(listener: Listener[Try[Int]], current: Int): Unit =
-    val runNow = synchronized:
-      if current != _counter then true
-      else
-        listeners += listener
-        false
-    if runNow then listener.completeNow(Success(_counter), this)
+    def onUpdate(current: Int)(using Async): Int =
+      if current != _counter then _counter
+      else this.await
 
-  def onUpdate(current: Int)(using Async): Int =
-    if current != _counter then _counter
-    else this.await
+    def cancel() =
+      val toLoop = synchronized:
+        val ls = listeners.toSeq
+        listeners.clear()
+        ls
+      for listener <- toLoop do
+        listener.completeNow(Failure(CancellationException()), this)
 
-  def cancel() =
-    val toLoop = synchronized:
-      val ls = listeners.toSeq
-      listeners.clear()
-      ls
-    for listener <- toLoop do
-      listener.completeNow(Failure(CancellationException()), this)
+    // Increment the counter and trigger the listener if it exists.
+    private[EpollPoller] def update() =
+      val n = _counter + 1
+      _counter = n
+      val toLoop = synchronized:
+        val ls = listeners.toSeq
+        listeners.clear()
+        ls
+      for listener <- toLoop do listener.completeNow(Success(n), this)
+  end MonitorChange
 
-  // Increment the counter and trigger the listener if it exists.
-  def update() =
-    val n = _counter + 1
-    _counter = n
-    val toLoop = synchronized:
-      val ls = listeners.toSeq
-      listeners.clear()
-      ls
-    for listener <- toLoop do listener.completeNow(Success(n), this)
+  class PollHandle(val fd: Int) extends Cancellable:
+    val read = MonitorChange()
+    val write = MonitorChange()
 
-class PollHandle(val fd: Int):
-  val read = MonitorChange()
-  val write = MonitorChange()
+    private[EpollPoller] def notify(mask: Int) =
+      if ((mask & EPOLLIN) > 0) then read.update()
+      if ((mask & EPOLLOUT) > 0) then write.update()
 
-  def notify(mask: Int) =
-    if ((mask & EPOLLIN) > 0) then read.update()
-    if ((mask & EPOLLOUT) > 0) then write.update()
-
-  def cancelMonitors() =
-    read.cancel()
-    write.cancel()
+    def cancel() =
+      read.cancel()
+      write.cancel()

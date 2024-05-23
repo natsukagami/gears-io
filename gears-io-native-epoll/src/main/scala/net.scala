@@ -27,12 +27,12 @@ class EpollTcpStream private[epoll] (
     poller: EpollPoller
 ) extends net.TcpStream:
   private val fd = ??? // SocketFd.ofSocket(socket)
-  private val (handle, cancel) =
+  private val handle =
     poller.registerFd(fd, true, true)
 
   override def close(): Unit =
     socket.close()
-    cancel.cancel()
+    handle.cancel()
 
   inline def debug[T](msg: String)(inline value: => T): T =
     val t = value
@@ -99,10 +99,10 @@ class EpollTcpListener private[epoll] (
   type Stream = EpollTcpStream
 
   val fd = ??? // SocketFd.ofServerSocket(socket)
-  val (handle, cancel) = poller.registerFd(fd, true, false)
+  val handle = poller.registerFd(fd, true, false)
 
   override def close(): Unit =
-    cancel.cancel()
+    handle.cancel()
     socket.close()
 
   override def accept()(using Async): Result[Stream] =

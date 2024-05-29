@@ -35,13 +35,100 @@ private[epoll] class UnixSocket(isStreaming: Boolean)(using
   private var port: Int = _
   private var localPort: Int = _
 
+  private inline def subscribeRead =
+    poller.registerFd(fd, read = true, write = false)
+  private inline def subscribeWrite =
+    poller.registerFd(fd, read = false, write = true)
+
+  // Read and Write
+
+  def readFut(buffer: Array[Byte], offset: Int, count: Int): Future[Int] =
+    import scalanative.unsafe.*
+    import scalanative.unsigned.*
+    import scalanative.posix.errno.*
+    inline def readNow =
+      socket.recv(fd, buffer.at(offset), count.toUInt, 0).toInt
+
+    Future.withResolver: resolver =>
+      var handle: EpollPoller.PollHandle = null
+      def loop(current: Int, bytes: Int): Unit =
+        bytes match
+          case _ if bytes > 0 => resolver.resolve(bytes)
+          case 0              => resolver.resolve(if count == 0 then 0 else -1)
+          case _ => // < 0
+            errno match
+              case e if e == EAGAIN || e == EWOULDBLOCK =>
+                if handle == null then
+                  handle = subscribeRead
+                  resolver.onCancel(handle.cancel)
+                handle.read.onUpdate(
+                  Listener:
+                    case (Success(next), _) => loop(next, readNow)
+                    case (Failure(exc), _) => resolver.reject(exc),
+                  current
+                )
+              case e =>
+                resolver.reject(
+                  new SocketException(s"read failed with errno $e")
+                )
+
+  // Connection set up
+
+  def bind(addr: InetAddress, port: Int) =
+    import scala.scalanative.unsafe.*
+    import scala.scalanative.posix.netinet.in
+    import scala.scalanative.posix.netinet.inOps._
+    def throwCannotBind(addr: InetAddress, extraMsg: String = ""): Nothing =
+      throw new java.net.BindException(
+        "Couldn't bind to address " + addr.getHostAddress() +
+          " on port " + port.toString + (if extraMsg == "" then s": $extraMsg"
+                                         else "")
+      )
+
+    def bind4(addr: InetAddress, port: Int) =
+      val sa4 = stackalloc[in.sockaddr_in]()
+      val sa4Len = sizeof[in.sockaddr_in].toUInt
+      addr match
+        case addr: java.net.Inet4Address =>
+          Helper.SockAddr.prepare4(addr, port, sa4)
+        case _ => throwCannotBind(addr, s"$addr is not an IPv4 address")
+
+      val bindRes = socket.bind(
+        fd,
+        sa4.asInstanceOf[Ptr[socket.sockaddr]],
+        sa4Len
+      )
+
+      if bindRes < 0 then throwCannotBind(addr)
+
+      this.localPort = fetchLocalPort(socket.AF_INET).getOrElse:
+        throwCannotBind(addr)
+    end bind4
+
+    def bind6(addr: InetAddress, port: Int) =
+      val sa6 = stackalloc[in.sockaddr_in6]()
+      val sa6Len = sizeof[in.sockaddr_in6].toUInt
+
+      // By contract, all the bytes in sa6 are zero going in.
+      Helper.SockAddr.prepare6(addr, port, sa6)
+
+      val bindRes = socket.bind(
+        fd,
+        sa6.asInstanceOf[Ptr[socket.sockaddr]],
+        sa6Len
+      )
+
+      if bindRes < 0 then throwCannotBind(addr)
+
+      this.localPort = fetchLocalPort(sa6.sin6_family.toInt).getOrElse:
+        throwCannotBind(addr)
+    end bind6
+
+    if Helper.useIPv4Stack then bind4(addr, port) else bind6(addr, port)
+  end bind
+
   def listen(backlog: Int): Unit =
     withErrno()(socket.listen(fd, backlog))
-
-  inline def connectFut(address: SocketAddress): Future[Unit] =
-    if Helper.useIPv4Stack then connect4(address) else connect6(address)
-
-  def connect(address: SocketAddress)(using Async) = connectFut(address).await
 
   private inline def withErrno(
       inline msg: Int => String = err => s"Socket failed with errno = $err"
@@ -52,142 +139,108 @@ private[epoll] class UnixSocket(isStreaming: Boolean)(using
       val err = scalanative.posix.errno.errno
       throw new IOException(msg(err))
 
-  // different logic for ipv4 and ipv6
-  private def connect4(address: SocketAddress): Future[Unit] =
+  def connect(address: SocketAddress)(using Async) = connectFut(address).await
+  def connectFut(address: SocketAddress): Future[Unit] =
     import scalanative.unsafe.*
+    import scalanative.unsigned.*
     import scalanative.posix.{netdb, netdbOps}, netdb.*, netdbOps.*
+    import scalanative.posix.netinet.in
     import scalanative.posix.errno.*
-    val hints = stackalloc[addrinfo]()
-    val ret = stackalloc[Ptr[addrinfo]]()
-    hints.ai_family = socket.AF_UNSPEC
-    hints.ai_flags = AI_NUMERICHOST | AI_NUMERICSERV
-    hints.ai_socktype = socket.SOCK_STREAM
-    val remoteAddress = address.getAddress.getHostAddress()
+    // different logic for ipv4 and ipv6
+    def connect4(address: SocketAddress): Future[Unit] =
+      val sa4 = stackalloc[in.sockaddr_in]()
+      val sa4Len = sizeof[in.sockaddr_in].toUInt
+      address.getAddress() match
+        case addr: java.net.Inet4Address =>
+          Helper.SockAddr.prepare4(addr, address.getPort(), sa4)
+        case _ =>
+          throw new ConnectException(
+            s"Trying to connect to $address: not an IPv4 address"
+          )
+      setNonBlocking()
 
-    Zone.acquire: zone =>
-      val cIP = toCString(remoteAddress)(using zone)
-      val cPort = toCString(address.getPort.toString)(using zone)
-      val retCode = getaddrinfo(cIP, cPort, hints, ret)
+      val connectErr =
+        if socket.connect(
+            fd,
+            sa4.asInstanceOf[Ptr[socket.sockaddr]],
+            sa4Len
+          ) == 0
+        then 0
+        else errno
 
-      if retCode != 0 then
-        throw new ConnectException(
-          s"Could not resolve address: ${remoteAddress}"
-            + s" on port: ${address.getPort}"
-            + s" return code: ${retCode}"
-        )
+      this.address = address.getAddress()
+      this.port = address.getPort()
+      handleConnectWait(connectErr, socket.AF_INET)
+    end connect4
 
-    val family = (!ret).ai_family
-    setNonBlocking()
+    def connect6(address: SocketAddress): Future[Unit] =
+      val sa6 = stackalloc[in.sockaddr_in6]()
+      val sa6Len = sizeof[in.sockaddr_in6].toUInt
+      Helper.SockAddr.prepare6(address.getAddress(), address.getPort(), sa6)
+      setNonBlocking()
 
-    val connectErr =
-      if socket.connect(fd, (!ret).ai_addr, (!ret).ai_addrlen) == 0 then 0
-      else errno
-    freeaddrinfo(!ret)
+      val connectErr =
+        if socket.connect(
+            fd,
+            sa6.asInstanceOf[Ptr[socket.sockaddr]],
+            sa6Len
+          ) == 0
+        then 0
+        else errno
+      handleConnectWait(connectErr, socket.AF_INET6)
+    end connect6
 
-    this.address = address.getAddress()
-    this.port = address.getPort()
-    handleConnectWait(connectErr, socket.AF_INET)
-  end connect4
-
-  def handleConnectWait(connectErr: Int, family: Int) =
-    import scalanative.posix.errno.*
-    import scalanative.unsafe.*
-    import scalanative.unsigned.*
-    def handleErr(
-        errOrZero: Int,
-        existingHandle: Option[(EpollPoller.PollHandle, Int)]
-    )(resolver: Future.Resolver[Unit]): Unit = errOrZero match
-      case 0 =>
-        resolver.complete:
-          Try:
-            this.localPort = fetchLocalPort(family).getOrElse:
-              throw new ConnectException(
-                "Could not resolve a local port when connecting"
-              )
-      case err
-          if err == EINPROGRESS | err == EAGAIN /* TODO: check `connect` again for Unix sockets */ =>
-        val (handle, current) = existingHandle.getOrElse:
-          val h = poller.registerFd(fd, read = false, write = true)
-          resolver.onCancel(h.cancel)
-          (h, 0)
-        handle.write.onUpdate(
-          current = current,
-          listener = Listener:
-            case (Success(next), _) =>
-              // collect error
-              val opt = stackalloc[CInt]()
-              val optLen = stackalloc[socket.socklen_t]()
-              !optLen = 1.toUInt
-              if socket.getsockopt(
-                  fd,
-                  socket.SOL_SOCKET,
-                  socket.SO_ERROR,
-                  opt,
-                  optLen
-                ) != 0
-              then
-                resolver.reject(
-                  ConnectException(
-                    "Exception while getting socket option, errno: " + errno
-                  )
+    def handleConnectWait(connectErr: Int, family: Int) =
+      var handle: EpollPoller.PollHandle = null
+      def handleErr(
+          errOrZero: Int,
+          current: Int
+      )(resolver: Future.Resolver[Unit]): Unit = errOrZero match
+        case 0 =>
+          resolver.complete:
+            Try:
+              this.localPort = fetchLocalPort(family).getOrElse:
+                throw new ConnectException(
+                  "Could not resolve a local port when connecting"
                 )
-              handleErr(!opt, Some(handle, next))(resolver)
-            case (Failure(err), _) => resolver.reject(err)
-        )
-      case err =>
-        resolver.reject(ConnectException("Connect failed with errno = " + err))
+        case err
+            if err == EINPROGRESS | err == EAGAIN /* TODO: check `connect` again for Unix sockets */ =>
+          if handle == null then
+            poller.registerFd(fd, read = false, write = true)
+            resolver.onCancel(handle.cancel)
+          handle.write.onUpdate(
+            current = current,
+            listener = Listener:
+              case (Success(next), _) =>
+                // collect error
+                val opt = stackalloc[CInt]()
+                val optLen = stackalloc[socket.socklen_t]()
+                !optLen = 1.toUInt
+                if socket.getsockopt(
+                    fd,
+                    socket.SOL_SOCKET,
+                    socket.SO_ERROR,
+                    opt,
+                    optLen
+                  ) != 0
+                then
+                  resolver.reject(
+                    ConnectException(
+                      "Exception while getting socket option, errno: " + errno
+                    )
+                  )
+                handleErr(!opt, next)(resolver)
+              case (Failure(err), _) => resolver.reject(err)
+          )
+        case err =>
+          resolver.reject(
+            ConnectException("Connect failed with errno = " + err)
+          )
 
-    Future.withResolver(handleErr(connectErr, None))
+      Future.withResolver(handleErr(connectErr, 0))
 
-  private def connect6(address: SocketAddress): Future[Unit] =
-    import scalanative.unsafe.*
-    import scalanative.unsigned.*
-    import scalanative.posix.net.*
-    import scalanative.posix.errno.*
-    import scalanative.runtime.ffi.memcpy
-    import scala.scalanative.posix.arpa.inet
-    import scalanative.posix.netinet.{in, inOps}, inOps.*
-
-    val sa6 = stackalloc[in.sockaddr_in6]()
-    val sa6Len = sizeof[in.sockaddr_in6].toUInt
-    // from scalanative's prepareSockaddrIn6
-    sa6.sin6_family = socket.AF_INET6.toUShort
-    sa6.sin6_port = inet.htons(address.getPort().toUShort)
-    val addr = address.getAddress()
-    val src = addr.getAddress()
-    addr match
-      case addr: Inet6Address =>
-        val from = src.asInstanceOf[scala.scalanative.runtime.Array[Byte]].at(0)
-        val dst = sa6.sin6_addr.at1.at(0).asInstanceOf[Ptr[Byte]]
-        memcpy(dst, from, 16.toUInt)
-
-        sa6.sin6_scope_id = addr
-          .getScopeId()
-          .toUShort
-      case _ => // Use IPv4mappedIPv6 address
-        // IPv4 addresses do not have a scope_id, so leave at current value 0
-
-        val dst = sa6.sin6_addr.toPtr.s6_addr
-
-        // By contract, the leading bytes are already zero already.
-        val FF = 255.toUByte
-        dst(10) = FF // set the IPv4mappedIPv6 indicator bytes
-        dst(11) = FF
-
-        // add the IPv4 trailing bytes, unrolling small loop
-        dst(12) = src(0).toUByte
-        dst(13) = src(1).toUByte
-        dst(14) = src(2).toUByte
-        dst(15) = src(3).toUByte
-
-    setNonBlocking()
-
-    val connectErr =
-      if socket.connect(fd, sa6.asInstanceOf[Ptr[socket.sockaddr]], sa6Len) == 0
-      then 0
-      else errno
-    handleConnectWait(connectErr, socket.AF_INET6)
-  end connect6
+    if Helper.useIPv4Stack then connect4(address) else connect6(address)
+  end connectFut
 
   private def fetchLocalPort(family: CInt): Option[Int] =
     import scalanative.unsafe.*
@@ -253,6 +306,64 @@ private object Helper:
 
     // Do the expensive test last.
     systemPropertyForcesIPv4 || !isIPv6Configured
+
+  // Sockaddr helpers
+  object SockAddr:
+    import java.net.Inet4Address
+    import scala.scalanative.unsafe.*
+    import scala.scalanative.unsigned.*
+    import scala.scalanative.posix.netinet.{in, inOps}, in.*, inOps.*
+    import scala.scalanative.posix.sys.socket, socket.*
+    import scala.scalanative.posix.arpa.inet
+    import scala.scalanative.posix.string.memcpy
+
+    def prepare4(
+        inetAddress: Inet4Address,
+        port: Int,
+        sa4: Ptr[in.sockaddr_in]
+    ): Unit =
+      sa4.sin_family = AF_INET.toUShort
+      sa4.sin_port = inet.htons(port.toUShort)
+      val src = inetAddress.getAddress()
+      val from = src.asInstanceOf[scala.scalanative.runtime.Array[Byte]].at(0)
+      val dst = sa4.sin_addr.at1.asInstanceOf[Ptr[Byte]]
+      memcpy(dst, from, 4.toUInt)
+
+    def prepare6(
+        inetAddress: InetAddress,
+        port: Int,
+        sa6: Ptr[in.sockaddr_in6]
+    ): Unit =
+      // from scalanative's prepareSockaddrIn6
+      sa6.sin6_family = socket.AF_INET6.toUShort
+      sa6.sin6_port = inet.htons(port.toUShort)
+      val src = inetAddress.getAddress()
+      inetAddress match
+        case addr: Inet6Address =>
+          val from =
+            src.asInstanceOf[scala.scalanative.runtime.Array[Byte]].at(0)
+          val dst = sa6.sin6_addr.at1.at(0).asInstanceOf[Ptr[Byte]]
+          memcpy(dst, from, 16.toUInt)
+
+          sa6.sin6_scope_id = addr
+            .getScopeId()
+            .toUShort
+        case _ => // Use IPv4mappedIPv6 address
+          // IPv4 addresses do not have a scope_id, so leave at current value 0
+
+          val dst = sa6.sin6_addr.toPtr.s6_addr
+
+          // By contract, the leading bytes are already zero already.
+          val FF = 255.toUByte
+          dst(10) = FF // set the IPv4mappedIPv6 indicator bytes
+          dst(11) = FF
+
+          // add the IPv4 trailing bytes, unrolling small loop
+          dst(12) = src(0).toUByte
+          dst(13) = src(1).toUByte
+          dst(14) = src(2).toUByte
+          dst(15) = src(3).toUByte
+  end SockAddr
 
   private lazy val isIPv6Configured =
     if LinktimeInfo.isWindows then false

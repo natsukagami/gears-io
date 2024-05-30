@@ -15,10 +15,12 @@ import java.net.Inet6Address
 import scala.scalanative.unsafe.CInt
 import java.net.InetAddress
 import scala.util.Try
+import scala.scalanative.windows.WinSocketApi
+import java.io.Closeable
 
 private[epoll] class UnixSocket(isStreaming: Boolean)(using
     poller: EpollPoller
-):
+) extends Closeable:
   /** The socket to be used */
   val fd =
     val af = if Helper.useIPv4Stack then socket.AF_INET else socket.AF_INET6
@@ -31,6 +33,9 @@ private[epoll] class UnixSocket(isStreaming: Boolean)(using
       )
     sock
 
+  def close() =
+    scalanative.posix.unistd.close(fd)
+
   private var address: InetAddress = _
   private var port: Int = _
   private var localPort: Int = _
@@ -40,7 +45,69 @@ private[epoll] class UnixSocket(isStreaming: Boolean)(using
   private inline def subscribeWrite =
     poller.registerFd(fd, read = false, write = true)
 
+  private inline def isMustWait(errno: Int) =
+    import scalanative.posix.errno.{EAGAIN, EWOULDBLOCK}
+    errno == EAGAIN || errno == EWOULDBLOCK
+
   // Read and Write
+
+  def read(buffer: Array[Byte], offset: Int, count: Int)(using Async): Int =
+    import scalanative.unsafe.*
+    import scalanative.unsigned.*
+    import scalanative.posix.errno.*
+
+    var handle: EpollPoller.PollHandle = null
+    @scala.annotation.tailrec def loop(current: Int): Int =
+      val bytesRead = socket.recv(fd, buffer.at(offset), count.toUInt, 0).toInt
+      if bytesRead > 0 then
+        bytesRead
+      else if bytesRead == 0 then
+        (if count == 0 then 0 else -1)
+      else
+        errno match
+          case e if isMustWait(e) =>
+            if handle == null then
+              handle = subscribeRead
+            loop(handle.read.onUpdate(current))
+          case e => throw new SocketException(s"read failed with errno $e")
+
+    try
+      loop(0)
+    finally
+      if handle != null then
+        handle.cancel()
+  end read
+
+  def write(buffer: Array[Byte], offset: Int, count: Int)(using Async): Int =
+    import scalanative.unsafe.*
+    import scalanative.unsigned.*
+    import scalanative.posix.errno.*
+
+    val cArr = buffer.at(offset)
+    var handle: EpollPoller.PollHandle = null
+    var current = 0
+    var sent = 0
+
+    try
+      while sent < count do
+        val ret = socket
+          .send(fd, cArr + sent, (count - sent).toUInt, socket.MSG_NOSIGNAL)
+          .toInt
+        if (ret < 0) then
+          errno match
+            case e if isMustWait(e) =>
+              if handle == null then
+                handle = subscribeWrite
+              current = handle.write.onUpdate(current)
+            case e =>
+              throw new SocketException(s"write failed with errno $e")
+        else
+          sent += ret
+      sent
+    finally
+      if handle != null then
+        handle.cancel()
+  end write
 
   def readFut(buffer: Array[Byte], offset: Int, count: Int): Future[Int] =
     import scalanative.unsafe.*
@@ -51,26 +118,68 @@ private[epoll] class UnixSocket(isStreaming: Boolean)(using
 
     Future.withResolver: resolver =>
       var handle: EpollPoller.PollHandle = null
+      inline def resolve(v: Int) =
+        if handle != null then handle.cancel()
+        resolver.resolve(v)
+      inline def reject(v: Throwable) =
+        if handle != null then handle.cancel()
+        resolver.reject(v)
       def loop(current: Int, bytes: Int): Unit =
         bytes match
-          case _ if bytes > 0 => resolver.resolve(bytes)
-          case 0              => resolver.resolve(if count == 0 then 0 else -1)
+          case _ if bytes > 0 => resolve(bytes)
+          case 0              => resolve(if count == 0 then 0 else -1)
           case _ => // < 0
             errno match
-              case e if e == EAGAIN || e == EWOULDBLOCK =>
+              case e if isMustWait(e) =>
                 if handle == null then
                   handle = subscribeRead
                   resolver.onCancel(handle.cancel)
                 handle.read.onUpdate(
                   Listener:
                     case (Success(next), _) => loop(next, readNow)
-                    case (Failure(exc), _) => resolver.reject(exc),
+                    case (Failure(exc), _) => reject(exc),
                   current
                 )
               case e =>
-                resolver.reject(
-                  new SocketException(s"read failed with errno $e")
-                )
+                reject(new SocketException(s"read failed with errno $e"))
+  end readFut
+
+  def writeFut(buffer: Array[Byte], offset: Int, count: Int): Future[Int] =
+    import scalanative.unsafe.*
+    import scalanative.unsigned.*
+    import scalanative.posix.errno.*
+    val cArr = buffer.at(offset)
+    inline def writeNow(sent: Int) =
+      socket.send(fd, cArr + sent, (count - sent).toUInt, 0).toInt
+
+    Future.withResolver: resolver =>
+      var handle: EpollPoller.PollHandle = null
+      inline def resolve(v: Int) =
+        if handle != null then handle.cancel()
+        resolver.resolve(v)
+      inline def reject(v: Throwable) =
+        if handle != null then handle.cancel()
+        resolver.reject(v)
+      def loop(sent: Int, current: Int): Unit =
+        if sent == count then resolve(0)
+        val bytesWritten = writeNow(sent)
+        if bytesWritten >= 0 then
+          loop(sent + bytesWritten, current)
+        else errno match
+          case e if isMustWait(e) =>
+            if handle == null then
+              handle = subscribeWrite
+              resolver.onCancel(handle.cancel)
+            handle.write.onUpdate(Listener:
+              case (Success(next), _) => loop(sent, next)
+              case (Failure(exc), _) => reject(exc),
+            current)
+          case e =>
+            reject(new SocketException(s"write failed with errno $e"))
+      end loop
+      loop(0, 0)
+
+  end writeFut
 
   // Connection set up
 

@@ -1,5 +1,5 @@
 /* A lot of code in this package is taken from scala-native. */
-package gears.io.epoll
+package gears.async.asyncio.epoll
 
 import gears.async.*
 import scala.scalanative.meta.LinktimeInfo
@@ -18,20 +18,15 @@ import scala.util.Try
 import scala.scalanative.windows.WinSocketApi
 import java.io.Closeable
 
-private[epoll] class UnixSocket(isStreaming: Boolean)(using
-    poller: EpollPoller
-) extends Closeable:
-  /** The socket to be used */
-  val fd =
-    val af = if Helper.useIPv4Stack then socket.AF_INET else socket.AF_INET6
-    val sockType = if isStreaming then socket.SOCK_STREAM else socket.SOCK_DGRAM
-    val sock = socket.socket(af, sockType, 0)
-    if sock < 0 then
-      throw new IOException(
-        s"Could not create a socket in address family: ${af}" +
-          s" streaming: ${isStreaming}"
-      )
-    sock
+sealed class UnixSocket protected (
+    protected var fd: Int,
+    protected var address: InetAddress = null,
+    protected var port: Int = 0,
+    protected var _localAddress: InetAddress = null,
+    protected var localPort: Int = 0
+)(using poller: EpollPoller)
+    extends Closeable:
+  private var _handle: EpollPoller.PollHandle = _
 
   def close() = synchronized:
     if _handle != null then
@@ -39,17 +34,24 @@ private[epoll] class UnixSocket(isStreaming: Boolean)(using
       _handle = null
     scalanative.posix.unistd.close(fd)
 
-  private var address: InetAddress = _
-  private var port: Int = _
-  private var localPort: Int = _
-  private var _handle: EpollPoller.PollHandle = null
+  // Address interfaces
 
-  private inline def handle = synchronized:
+  def getRemoteSocketAddress =
+    if address == null then null
+    else java.net.InetSocketAddress(address, port)
+
+  def getLocalSocketAddress =
+    if _localAddress == null then null
+    else java.net.InetSocketAddress(_localAddress, localPort)
+
+  // Handle
+
+  protected inline def handle = synchronized:
     if _handle == null then
       _handle = poller.registerFd(fd, read = true, write = false)
     _handle
 
-  private inline def isMustWait(errno: Int) =
+  protected inline def isMustWait(errno: Int) =
     import scalanative.posix.errno.{EAGAIN, EWOULDBLOCK}
     errno == EAGAIN || errno == EWOULDBLOCK
 
@@ -149,8 +151,72 @@ private[epoll] class UnixSocket(isStreaming: Boolean)(using
       loop(0, 0)
   end writeFut
 
-  // Connection set up
+  // low level socketFd opts
 
+  import scala.scalanative.unsafe.CInt
+  import scala.scalanative.posix.fcntl.*
+
+  protected def fetchLocalPort(family: CInt): Option[Int] =
+    import scalanative.unsafe.*
+    import scalanative.posix.netinet.{in, inOps}, inOps.*
+    import scalanative.posix.arpa.inet
+    val len = stackalloc[socket.socklen_t]()
+    val res = if family == socket.AF_INET then
+      val sin = stackalloc[in.sockaddr_in]()
+      !len = sizeof[in.sockaddr_in].toUInt
+      if socket.getsockname(
+          fd,
+          sin.asInstanceOf[Ptr[socket.sockaddr]],
+          len
+        ) == -1
+      then None
+      else Some(sin.sin_port)
+    else if family == socket.AF_INET6 then
+      val sin = stackalloc[in.sockaddr_in6]()
+      !len = sizeof[in.sockaddr_in6].toUInt
+      if socket.getsockname(
+          fd,
+          sin.asInstanceOf[Ptr[socket.sockaddr]],
+          len
+        ) == -1
+      then None
+      else Some(sin.sin6_port)
+    else None
+
+    res.map(inet.ntohs(_).toInt)
+
+  protected inline def withErrno(
+      inline msg: Int => String = err => s"Socket failed with errno = $err"
+  )(inline op: => Int) =
+    val res = op
+    if res >= 0 then res
+    else
+      val err = scalanative.posix.errno.errno
+      throw new IOException(msg(err))
+
+  protected def setNonBlocking(): Unit = updateSocketFdOpts(fd)(_ | O_NONBLOCK)
+
+  private inline def getSocketFdOpts(fdFd: Int): CInt =
+    withErrno("connect failed, fcntl F_GETFL, errno: " + _):
+      fcntl(fdFd, F_GETFL, 0)
+
+  private inline def setSocketFdOpts(fdFd: Int, opts: Int): Unit =
+    withErrno(
+      s"connect failed, fcntl F_SETFL for opts: $opts, errno: " + _
+    ):
+      fcntl(fdFd, F_SETFL, opts)
+
+  protected inline def updateSocketFdOpts(fdFd: Int)(
+      mapping: CInt => CInt
+  ): Int =
+    val oldOpts = getSocketFdOpts(fdFd)
+    setSocketFdOpts(fdFd, mapping(oldOpts))
+    oldOpts
+end UnixSocket
+
+private[epoll] class UnixServerSocket(isStreaming: Boolean)(using
+    poller: EpollPoller
+) extends UnixSocket(fd = Helper.createFd(isStreaming)):
   def bind(addr: InetAddress, port: Int) =
     import scala.scalanative.unsafe.*
     import scala.scalanative.posix.netinet.in
@@ -167,7 +233,7 @@ private[epoll] class UnixSocket(isStreaming: Boolean)(using
       val sa4Len = sizeof[in.sockaddr_in].toUInt
       addr match
         case addr: java.net.Inet4Address =>
-          Helper.SockAddr.prepare4(addr, port, sa4)
+          Helper.SockAddr.toSockAddr4(addr, port, sa4)
         case _ => throwCannotBind(addr, s"$addr is not an IPv4 address")
 
       val bindRes = socket.bind(
@@ -178,6 +244,7 @@ private[epoll] class UnixSocket(isStreaming: Boolean)(using
 
       if bindRes < 0 then throwCannotBind(addr)
 
+      this._localAddress = addr
       this.localPort = fetchLocalPort(socket.AF_INET).getOrElse:
         throwCannotBind(addr)
     end bind4
@@ -187,7 +254,7 @@ private[epoll] class UnixSocket(isStreaming: Boolean)(using
       val sa6Len = sizeof[in.sockaddr_in6].toUInt
 
       // By contract, all the bytes in sa6 are zero going in.
-      Helper.SockAddr.prepare6(addr, port, sa6)
+      Helper.SockAddr.toSockAddr6(addr, port, sa6)
 
       val bindRes = socket.bind(
         fd,
@@ -197,6 +264,7 @@ private[epoll] class UnixSocket(isStreaming: Boolean)(using
 
       if bindRes < 0 then throwCannotBind(addr)
 
+      this._localAddress = addr
       this.localPort = fetchLocalPort(sa6.sin6_family.toInt).getOrElse:
         throwCannotBind(addr)
     end bind6
@@ -207,15 +275,80 @@ private[epoll] class UnixSocket(isStreaming: Boolean)(using
   def listen(backlog: Int): Unit =
     withErrno()(socket.listen(fd, backlog))
 
-  private inline def withErrno(
-      inline msg: Int => String = err => s"Socket failed with errno = $err"
-  )(inline op: => Int) =
-    val res = op
-    if res >= 0 then res
-    else
-      val err = scalanative.posix.errno.errno
-      throw new IOException(msg(err))
+  def accept()(using Async): UnixSocket =
+    import scalanative.unsafe.*
+    import scalanative.posix.errno.*
+    import scalanative.posix.netinet.in
+    @scala.annotation.tailrec
+    def loop(current: Int): UnixSocket =
+      Zone.acquire: zone =>
+        given zone.type = zone
+        val storage = alloc[socket.sockaddr_storage]()
+        val address = storage.asInstanceOf[Ptr[socket.sockaddr]]
+        val addressLen = alloc[socket.socklen_t]()
+        !addressLen = sizeof[in.sockaddr_in6].toUInt
 
+        val newFd = socket.accept(fd, address, addressLen)
+        if newFd == -1 then Left(errno)
+        else
+          val insAddr = Helper.SockAddr.fromSockAddr(address)
+          Right(
+            new UnixSocket(
+              fd = newFd,
+              address = insAddr.getAddress(),
+              port = insAddr.getPort(),
+              localPort = this.localPort
+            )
+          )
+      match
+        case Right(value)                 => value
+        case Left(err) if isMustWait(err) => loop(handle.read.onUpdate(current))
+        case Left(err) =>
+          throw SocketException(s"Accept failed with errno = $err")
+    loop(0)
+
+  def acceptFut(): Future[UnixSocket] =
+    import scalanative.unsafe.*
+    import scalanative.posix.errno.*
+    import scalanative.posix.netinet.in
+    Future.withResolver: resolver =>
+      def loop(current: Int): Unit =
+        val result = Zone.acquire: zone =>
+          given zone.type = zone
+          val storage = alloc[socket.sockaddr_storage]()
+          val address = storage.asInstanceOf[Ptr[socket.sockaddr]]
+          val addressLen = alloc[socket.socklen_t]()
+          !addressLen = sizeof[in.sockaddr_in6].toUInt
+
+          val newFd = socket.accept(fd, address, addressLen)
+          if newFd == -1 then Left(errno)
+          else
+            val insAddr = Helper.SockAddr.fromSockAddr(address)
+            Right(
+              new UnixSocket(
+                fd = newFd,
+                address = insAddr.getAddress(),
+                port = insAddr.getPort(),
+                localPort = this.localPort
+              )
+            )
+        result match
+          case Right(value) => resolver.resolve(value)
+          case Left(err) if isMustWait(err) =>
+            val listener = Listener[Try[Int]]:
+              case (Success(next), _) => loop(next)
+              case (Failure(exc), _)  => resolver.reject(exc)
+            resolver.onCancel(() => handle.read.dropListener(listener))
+            handle.read.onUpdate(listener, current)
+          case Left(err) =>
+            resolver.reject(SocketException(s"Accept failed with errno = $err"))
+      loop(0)
+end UnixServerSocket
+
+private[epoll] class UnixClientSocket(isStreaming: Boolean)(using
+    poller: EpollPoller
+) extends UnixSocket(fd = Helper.createFd(isStreaming)):
+  // Connection set up
   def connect(address: SocketAddress)(using Async) = connectFut(address).await
   def connectFut(address: SocketAddress): Future[Unit] =
     import scalanative.unsafe.*
@@ -229,7 +362,7 @@ private[epoll] class UnixSocket(isStreaming: Boolean)(using
       val sa4Len = sizeof[in.sockaddr_in].toUInt
       address.getAddress() match
         case addr: java.net.Inet4Address =>
-          Helper.SockAddr.prepare4(addr, address.getPort(), sa4)
+          Helper.SockAddr.toSockAddr4(addr, address.getPort(), sa4)
         case _ =>
           throw new ConnectException(
             s"Trying to connect to $address: not an IPv4 address"
@@ -253,7 +386,7 @@ private[epoll] class UnixSocket(isStreaming: Boolean)(using
     def connect6(address: SocketAddress): Future[Unit] =
       val sa6 = stackalloc[in.sockaddr_in6]()
       val sa6Len = sizeof[in.sockaddr_in6].toUInt
-      Helper.SockAddr.prepare6(address.getAddress(), address.getPort(), sa6)
+      Helper.SockAddr.toSockAddr6(address.getAddress(), address.getPort(), sa6)
       setNonBlocking()
 
       val connectErr =
@@ -318,61 +451,20 @@ private[epoll] class UnixSocket(isStreaming: Boolean)(using
 
     if Helper.useIPv4Stack then connect4(address) else connect6(address)
   end connectFut
-
-  private def fetchLocalPort(family: CInt): Option[Int] =
-    import scalanative.unsafe.*
-    import scalanative.posix.netinet.{in, inOps}, inOps.*
-    import scalanative.posix.arpa.inet
-    val len = stackalloc[socket.socklen_t]()
-    val res = if family == socket.AF_INET then
-      val sin = stackalloc[in.sockaddr_in]()
-      !len = sizeof[in.sockaddr_in].toUInt
-      if socket.getsockname(
-          fd,
-          sin.asInstanceOf[Ptr[socket.sockaddr]],
-          len
-        ) == -1
-      then None
-      else Some(sin.sin_port)
-    else if family == socket.AF_INET6 then
-      val sin = stackalloc[in.sockaddr_in6]()
-      !len = sizeof[in.sockaddr_in6].toUInt
-      if socket.getsockname(
-          fd,
-          sin.asInstanceOf[Ptr[socket.sockaddr]],
-          len
-        ) == -1
-      then None
-      else Some(sin.sin6_port)
-    else None
-
-    res.map(inet.ntohs(_).toInt)
-
-  // low level socketFd opts
-
-  import scala.scalanative.unsafe.CInt
-  import scala.scalanative.posix.fcntl.*
-
-  private def setNonBlocking(): Unit = updateSocketFdOpts(fd)(_ | O_NONBLOCK)
-
-  private inline def getSocketFdOpts(fdFd: Int): CInt =
-    withErrno("connect failed, fcntl F_GETFL, errno: " + _):
-      fcntl(fdFd, F_GETFL, 0)
-
-  private inline def setSocketFdOpts(fdFd: Int, opts: Int): Unit =
-    withErrno(
-      s"connect failed, fcntl F_SETFL for opts: $opts, errno: " + _
-    ):
-      fcntl(fdFd, F_SETFL, opts)
-
-  private inline def updateSocketFdOpts(fdFd: Int)(mapping: CInt => CInt): Int =
-    val oldOpts = getSocketFdOpts(fdFd)
-    setSocketFdOpts(fdFd, mapping(oldOpts))
-    oldOpts
-
-end UnixSocket
+end UnixClientSocket
 
 private object Helper:
+  def createFd(isStreaming: Boolean) =
+    val af = if useIPv4Stack then socket.AF_INET else socket.AF_INET6
+    val sockType = if isStreaming then socket.SOCK_STREAM else socket.SOCK_DGRAM
+    val sock = socket.socket(af, sockType, 0)
+    if sock < 0 then
+      throw new IOException(
+        s"Could not create a socket in address family: ${af}" +
+          s" streaming: ${isStreaming}"
+      )
+    sock
+
   // A Single Point of Truth to toggle IPv4/IPv6 underlying transport protocol.
   lazy val useIPv4Stack =
     // Java defaults to "false"
@@ -391,10 +483,11 @@ private object Helper:
     import scala.scalanative.unsigned.*
     import scala.scalanative.posix.netinet.{in, inOps}, in.*, inOps.*
     import scala.scalanative.posix.sys.socket, socket.*
+    import scalanative.posix.sys.socketOps.*
     import scala.scalanative.posix.arpa.inet
     import scala.scalanative.posix.string.memcpy
 
-    def prepare4(
+    def toSockAddr4(
         inetAddress: Inet4Address,
         port: Int,
         sa4: Ptr[in.sockaddr_in]
@@ -406,7 +499,7 @@ private object Helper:
       val dst = sa4.sin_addr.at1.asInstanceOf[Ptr[Byte]]
       memcpy(dst, from, 4.toUInt)
 
-    def prepare6(
+    def toSockAddr6(
         inetAddress: InetAddress,
         port: Int,
         sa6: Ptr[in.sockaddr_in6]
@@ -440,6 +533,90 @@ private object Helper:
           dst(13) = src(1).toUByte
           dst(14) = src(2).toUByte
           dst(15) = src(3).toUByte
+    end toSockAddr6
+
+    def fromSockAddr(sockAddr: Ptr[socket.sockaddr]): SocketAddress =
+      val addr: InetAddress = sockaddrToInetAddres(sockAddr, "")
+      val port: Int = sockaddrToPort(sockAddr)
+      new SocketAddress(addr, port)
+
+    private def sockaddrToInetAddres(
+        sin: Ptr[socket.sockaddr],
+        host: String
+    ): InetAddress =
+      if sin.sa_family == AF_INET then
+        InetAddress.getByAddress(host, sockaddrToByteArray(sin))
+      else
+        val sin6 = sin.asInstanceOf[Ptr[sockaddr_in6]]
+        val addrBytes = sin6.sin6_addr.at1.at(0).asInstanceOf[Ptr[Byte]]
+        // Scala JVM down-converts even when preferIPv6Addresses is "true"
+        if isIPv4MappedAddress(addrBytes) then
+          InetAddress.getByAddress(host, extractIP4Bytes(addrBytes))
+        else
+          /* Yes, Java specifies Int for scope_id in a way which disallows
+           * some values POSIX/IEEE/IETF allows.
+           */
+
+          val scope_id = sin6.sin6_scope_id.toInt
+
+          /* Be aware some trickiness here.
+           * Java treats a 0 scope_id (qua NetworkInterface index)
+           * as having been not supplied.
+           * Exactly the same 0 scope_id explicitly passed to
+           * Inet6Address.getByAddress() is considered supplied and
+           * displayed as such.
+           */
+
+          // Keep address bytes passed in immutable, get new Array.
+          val clonedBytes = sockaddrToByteArray(sin)
+          if scope_id == 0 then InetAddress.getByAddress(host, clonedBytes)
+          else Inet6Address.getByAddress(host, clonedBytes, scope_id)
+    end sockaddrToInetAddres
+
+    private def sockaddrToByteArray(
+        sockAddr: Ptr[sockaddr]
+    ): Array[Byte] =
+      val af = sockAddr.sa_family.toInt
+      val (src, size) = if af == AF_INET6 then
+        val v6addr = sockAddr.asInstanceOf[Ptr[in.sockaddr_in6]]
+        val sin6Addr = v6addr.sin6_addr.at1.asInstanceOf[Ptr[Byte]]
+        // Scala JVM down-converts even when preferIPv6Addresses is "true"
+        if isIPv4MappedAddress(sin6Addr) then (sin6Addr + 12, 4)
+        else (sin6Addr, 16)
+      else if af == AF_INET then
+        val v4addr = sockAddr.asInstanceOf[Ptr[in.sockaddr_in]]
+        val sin4Addr = v4addr.sin_addr.at1.asInstanceOf[Ptr[Byte]]
+        (sin4Addr, 4)
+      else throw new SocketException(s"Unsupported address family: ${af}")
+
+      val byteArray = new Array[Byte](size)
+      memcpy(byteArray.at(0), src, size.toUInt)
+
+      byteArray
+    end sockaddrToByteArray
+
+    private def sockaddrToPort(sockAddr: Ptr[sockaddr]): Int =
+      val af = sockAddr.sa_family.toInt
+      val inPort =
+        if af == AF_INET6 then
+          sockAddr.asInstanceOf[Ptr[in.sockaddr_in6]].sin6_port
+        else if af == AF_INET then
+          sockAddr.asInstanceOf[Ptr[in.sockaddr_in]].sin_port
+        else throw SocketException(s"Unsupported address family: ${af}")
+      inet.ntohs(inPort).toInt
+
+    private def isIPv4MappedAddress(pb: Ptr[Byte]): Boolean =
+      val ptrInt = pb.asInstanceOf[Ptr[Int]]
+      val ptrLong = pb.asInstanceOf[Ptr[Long]]
+      (ptrInt(2) == 0xffff0000) && (ptrLong(0) == 0x0L)
+
+    private def extractIP4Bytes(pb: Ptr[Byte]): Array[Byte] =
+      val buf = new Array[Byte](4)
+      buf(0) = pb(12)
+      buf(1) = pb(13)
+      buf(2) = pb(14)
+      buf(3) = pb(15)
+      buf
   end SockAddr
 
   private lazy val isIPv6Configured =

@@ -85,6 +85,7 @@ lazy val sandbox =
             .withLTO(LTO.none)
             .withMode(Mode.debug)
             .withGC(GC.immix)
+            .withSourceLevelDebuggingConfig(SourceLevelDebuggingConfig.enabled)
         }
       )
     )

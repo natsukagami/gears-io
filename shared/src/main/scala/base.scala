@@ -19,7 +19,7 @@ import scala.collection.mutable.ArrayBuffer
 import scala.collection.mutable.ArraySeq
 
 /** The general buffer type of the traits. */
-type Buffer = java.nio.ByteBuffer
+export java.nio.{ByteBuffer => Buffer}
 
 /** An asynchronous reader. */
 trait Reader:

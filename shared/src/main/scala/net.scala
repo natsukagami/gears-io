@@ -7,12 +7,12 @@ import gears.async.asyncio.Result
 import java.net.SocketAddress
 
 // Represents a connected TCP stream.
-abstract class TcpStream extends Reader, Writer, Closeable:
+trait TcpStream extends Reader, Writer, Closeable:
   def localAddress: SocketAddress
   def remoteAddress: SocketAddress
 
 // Represents a TCP server/listener.
-abstract class TcpListener extends Closeable:
+trait TcpListener extends Closeable:
   type Stream <: TcpStream
 
   def accept()(using Async): Result[Stream]

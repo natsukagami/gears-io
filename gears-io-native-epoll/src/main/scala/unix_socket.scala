@@ -17,22 +17,42 @@ import java.net.InetAddress
 import scala.util.Try
 import scala.scalanative.windows.WinSocketApi
 import java.io.Closeable
+import Helper.*
 
-sealed class UnixSocket protected (
+private object UnixSocket:
+  val counter = scala.collection.mutable.Map.empty[String, Int]
+
+sealed abstract class UnixSocket protected (
     protected var fd: Int,
     protected var address: InetAddress = null,
     protected var port: Int = 0,
-    protected var _localAddress: InetAddress = null,
+    protected var localAddress: InetAddress = null,
     protected var localPort: Int = 0
 )(using poller: EpollPoller)
     extends Closeable:
-  private var _handle: EpollPoller.PollHandle = _
+
+  var closed = false
+
+  def getFd = fd
+
+  val index =
+    UnixSocket.synchronized:
+      UnixSocket.counter
+        .updateWith(this.getClass.getName):
+          case Some(v) => Some(v + 1)
+          case None    => Some(1)
+        .get
+  println(s"new $this [#$index] with fd = $fd")
+  setNonBlocking()
 
   def close() = synchronized:
-    if _handle != null then
-      _handle.cancel()
-      _handle = null
-    scalanative.posix.unistd.close(fd)
+    if !closed then
+      if _handle != null then
+        _handle.cancel()
+        _handle = null
+      println(s"closing $this [#$index] with fd = $fd")
+      scalanative.posix.unistd.close(fd)
+      closed = true
 
   // Address interfaces
 
@@ -41,14 +61,15 @@ sealed class UnixSocket protected (
     else java.net.InetSocketAddress(address, port)
 
   def getLocalSocketAddress =
-    if _localAddress == null then null
-    else java.net.InetSocketAddress(_localAddress, localPort)
+    if localAddress == null then null
+    else java.net.InetSocketAddress(localAddress, localPort)
 
   // Handle
 
+  private var _handle: EpollPoller.PollHandle = _
   protected inline def handle = synchronized:
     if _handle == null then
-      _handle = poller.registerFd(fd, read = true, write = false)
+      _handle = poller.registerFd(fd, read = true, write = true)
     _handle
 
   protected inline def isMustWait(errno: Int) =
@@ -114,7 +135,9 @@ sealed class UnixSocket protected (
                   Listener[Try[Int]]:
                     case (Success(next), _) => loop(next, readNow)
                     case (Failure(exc), _)  => resolver.reject(exc)
-                resolver.onCancel(() => handle.read.dropListener(listener))
+                resolver.onCancelReject(() =>
+                  handle.read.dropListener(listener)
+                )
                 handle.read.onUpdate(listener, current)
               case e =>
                 resolver.reject(
@@ -141,7 +164,7 @@ sealed class UnixSocket protected (
               val listener = Listener[Try[Int]]:
                 case (Success(next), _) => loop(sent, next)
                 case (Failure(exc), _)  => resolver.reject(exc)
-              resolver.onCancel(() => handle.write.dropListener(listener))
+              resolver.onCancelReject(() => handle.write.dropListener(listener))
               handle.write.onUpdate(listener, current)
             case e =>
               resolver.reject(
@@ -197,12 +220,12 @@ sealed class UnixSocket protected (
   protected def setNonBlocking(): Unit = updateSocketFdOpts(fd)(_ | O_NONBLOCK)
 
   private inline def getSocketFdOpts(fdFd: Int): CInt =
-    withErrno("connect failed, fcntl F_GETFL, errno: " + _):
+    withErrno(s"connect failed, fcntl F_GETFL $fdFd, errno: " + _):
       fcntl(fdFd, F_GETFL, 0)
 
   private inline def setSocketFdOpts(fdFd: Int, opts: Int): Unit =
     withErrno(
-      s"connect failed, fcntl F_SETFL for opts: $opts, errno: " + _
+      s"connect failed, fcntl F_SETFL $fdFd for opts: $opts, errno: " + _
     ):
       fcntl(fdFd, F_SETFL, opts)
 
@@ -217,10 +240,38 @@ end UnixSocket
 private[epoll] class UnixServerSocket(isStreaming: Boolean)(using
     poller: EpollPoller
 ) extends UnixSocket(fd = Helper.createFd(isStreaming)):
-  def bind(addr: InetAddress, port: Int) =
+  private final class AcceptedSocket(
+      fd: Int,
+      address: InetAddress,
+      port: Int,
+      localPort: Int
+  )(using poller: EpollPoller)
+      extends UnixSocket(
+        fd = fd,
+        address = address,
+        port = port,
+        localPort = localPort
+      )
+
+  inline def bind(addr: SocketAddress): Unit =
+    bind(addr.getAddress(), addr.getPort())
+  def bind(addr: InetAddress, port: Int): Unit =
     import scala.scalanative.unsafe.*
+    import scala.scalanative.unsigned.*
     import scala.scalanative.posix.netinet.in
+    import scala.scalanative.libc.errno
     import scala.scalanative.posix.netinet.inOps._
+
+    scalanative.unsafe.Zone.acquire: zone =>
+      val opt = socket.SO_REUSEADDR
+      val level = socket.SOL_SOCKET
+      val len: socket.socklen_t = sizeof[CInt].toUInt
+      val value =
+        val r = alloc[CInt](1)(using zone)
+        !r = 1
+        r.asInstanceOf[Ptr[Byte]]
+      if socket.setsockopt(fd, level, opt, value, len) < 0 then
+        throw IOException(s"${errno.errno}")
     def throwCannotBind(addr: InetAddress, extraMsg: String = ""): Nothing =
       throw new java.net.BindException(
         "Couldn't bind to address " + addr.getHostAddress() +
@@ -244,7 +295,7 @@ private[epoll] class UnixServerSocket(isStreaming: Boolean)(using
 
       if bindRes < 0 then throwCannotBind(addr)
 
-      this._localAddress = addr
+      this.localAddress = addr
       this.localPort = fetchLocalPort(socket.AF_INET).getOrElse:
         throwCannotBind(addr)
     end bind4
@@ -264,7 +315,7 @@ private[epoll] class UnixServerSocket(isStreaming: Boolean)(using
 
       if bindRes < 0 then throwCannotBind(addr)
 
-      this._localAddress = addr
+      this.localAddress = addr
       this.localPort = fetchLocalPort(sa6.sin6_family.toInt).getOrElse:
         throwCannotBind(addr)
     end bind6
@@ -288,12 +339,14 @@ private[epoll] class UnixServerSocket(isStreaming: Boolean)(using
         val addressLen = alloc[socket.socklen_t]()
         !addressLen = sizeof[in.sockaddr_in6].toUInt
 
+        println(s"accepting $fd[$current]")
         val newFd = socket.accept(fd, address, addressLen)
+        println(s"accepting $fd[$current] => $newFd")
         if newFd == -1 then Left(errno)
         else
           val insAddr = Helper.SockAddr.fromSockAddr(address)
           Right(
-            new UnixSocket(
+            AcceptedSocket(
               fd = newFd,
               address = insAddr.getAddress(),
               port = insAddr.getPort(),
@@ -325,7 +378,7 @@ private[epoll] class UnixServerSocket(isStreaming: Boolean)(using
           else
             val insAddr = Helper.SockAddr.fromSockAddr(address)
             Right(
-              new UnixSocket(
+              AcceptedSocket(
                 fd = newFd,
                 address = insAddr.getAddress(),
                 port = insAddr.getPort(),
@@ -338,7 +391,7 @@ private[epoll] class UnixServerSocket(isStreaming: Boolean)(using
             val listener = Listener[Try[Int]]:
               case (Success(next), _) => loop(next)
               case (Failure(exc), _)  => resolver.reject(exc)
-            resolver.onCancel(() => handle.read.dropListener(listener))
+            resolver.onCancelReject(() => handle.read.dropListener(listener))
             handle.read.onUpdate(listener, current)
           case Left(err) =>
             resolver.reject(SocketException(s"Accept failed with errno = $err"))
@@ -367,7 +420,6 @@ private[epoll] class UnixClientSocket(isStreaming: Boolean)(using
           throw new ConnectException(
             s"Trying to connect to $address: not an IPv4 address"
           )
-      setNonBlocking()
 
       val connectErr =
         if socket.connect(
@@ -387,7 +439,6 @@ private[epoll] class UnixClientSocket(isStreaming: Boolean)(using
       val sa6 = stackalloc[in.sockaddr_in6]()
       val sa6Len = sizeof[in.sockaddr_in6].toUInt
       Helper.SockAddr.toSockAddr6(address.getAddress(), address.getPort(), sa6)
-      setNonBlocking()
 
       val connectErr =
         if socket.connect(
@@ -416,8 +467,7 @@ private[epoll] class UnixClientSocket(isStreaming: Boolean)(using
         case err
             if err == EINPROGRESS | err == EAGAIN /* TODO: check `connect` again for Unix sockets */ =>
           if handle == null then
-            poller.registerFd(fd, read = false, write = true)
-            resolver.onCancel(handle.cancel)
+            handle = poller.registerFd(fd, read = false, write = true)
           handle.write.onUpdate(
             current = current,
             listener = Listener:
@@ -447,7 +497,13 @@ private[epoll] class UnixClientSocket(isStreaming: Boolean)(using
             ConnectException("Connect failed with errno = " + err)
           )
 
-      Future.withResolver(handleErr(connectErr, 0))
+      Future.withResolver[Unit]: r =>
+        Future
+          .withResolver(handleErr(connectErr, 0))
+          .onComplete(Listener((res, _) =>
+            if handle != null then handle.cancel()
+            r.complete(res)
+          ))
 
     if Helper.useIPv4Stack then connect4(address) else connect6(address)
   end connectFut
@@ -651,4 +707,10 @@ private object Helper:
             else ai.ai_addr.sa_family == AF_INET6
           finally freeaddrinfo(!ret)
       result
+
+  extension [T](r: gears.async.Future.Resolver[T])
+    inline def onCancelReject(f: () => Unit): Unit =
+      r.onCancel: () =>
+        f()
+        r.rejectAsCancelled()
 end Helper

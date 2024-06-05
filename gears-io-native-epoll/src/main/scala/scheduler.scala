@@ -42,7 +42,7 @@ class EpollScheduler(val exec: ExecutionContext) extends Scheduler:
   private val poller = EpollPoller(epfd)
   private val executor = ExecutorWithPollThread(exec, poller)
 
-  def tcpSupport = new EpollTcpSupport(poller) {}
+  def tcpSupport = new EpollTcpSupport(using poller) {}
 
 trait Poller:
   def poll(timeout: Duration): Unit
